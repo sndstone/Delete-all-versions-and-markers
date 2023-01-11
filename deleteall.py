@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #Asks inputs to run run the script
 BUCKET_NAME = input("Enter the bucket name: ")
-S3_ENDPOINT_URL = input("Enter the S3 endpoint URL including http// - https://: ")
+S3_ENDPOINT_URL = input("Enter the S3 endpoint URL and portnumber")
 AWS_ACCESS_KEY_ID = input("Enter the AWS access key ID: ")
 AWS_SECRET_ACCESS_KEY = input("Enter the AWS secret access key: ")
 
