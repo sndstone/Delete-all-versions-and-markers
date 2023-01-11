@@ -102,5 +102,4 @@ with ThreadPoolExecutor() as executor:
     for future in as_completed(futures):
         # Print the result of each future
         print(future.result())
-if not BUCKET_NAME or not S3_ENDPOINT_URL or not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
     exit()
