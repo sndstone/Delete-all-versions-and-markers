@@ -1,5 +1,6 @@
 # Delete-all-versions-and-markers
 !!!WARNING THIS WILL DELETE ALL DATA IN THE SPECIFIED BUCKET!!!
+
 Deletes all versions and delete markers from an S3 bucket using Boto3
 Current project is a work in progress so if you have any ideas to improve please let them know and add them to the project.
 
