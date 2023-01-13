@@ -11,6 +11,7 @@ AWS_SECRET_ACCESS_KEY = input("Enter the AWS secret access key: ")
 # Define the S3 client
 s3_client = boto3.client(
     's3',
+    verify=False
     endpoint_url=S3_ENDPOINT_URL,
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
