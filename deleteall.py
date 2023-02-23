@@ -14,8 +14,7 @@ s3_client = boto3.client(
     verify=False
     endpoint_url=S3_ENDPOINT_URL,
     aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
-)
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
 
 # Get a paginator for listing object versions
 object_response_paginator = s3_client.get_paginator('list_object_versions')
