@@ -2,16 +2,32 @@
 import boto3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-#Asks inputs to run run the script
-BUCKET_NAME = input("Enter the bucket name: ")
-S3_ENDPOINT_URL = input("Enter the S3 endpoint URL and portnumber:")
-AWS_ACCESS_KEY_ID = input("Enter the AWS access key ID: ")
-AWS_SECRET_ACCESS_KEY = input("Enter the AWS secret access key: ")
+# Function to read credentials from JSON file
+def read_credentials_from_json(file_path):
+    with open(file_path, "r") as json_file:
+        credentials = json.load(json_file)
+        return credentials
+
+# Asks inputs to run run the script
+JSON_IMPORT = input("Do you want to import JSON file for configuration? (yes/no): ")
+
+if JSON_IMPORT.lower() == "yes":
+    JSON_FILE_PATH = input("Enter the JSON file path: ")
+    credentials = read_credentials_from_json(JSON_FILE_PATH)
+    BUCKET_NAME = credentials["bucket_name"]
+    S3_ENDPOINT_URL = credentials["s3_endpoint_url"]
+    AWS_ACCESS_KEY_ID = credentials["aws_access_key_id"]
+    AWS_SECRET_ACCESS_KEY = credentials["aws_secret_access_key"]
+else:
+    BUCKET_NAME = input("Enter the bucket name: ")
+    S3_ENDPOINT_URL = input("Enter the S3 endpoint URL, (EXAMPLE http://example.com:443): ")
+    AWS_ACCESS_KEY_ID = input("Enter the AWS access key ID: ")
+    AWS_SECRET_ACCESS_KEY = input("Enter the AWS secret access key: ")
 
 # Define the S3 client
 s3_client = boto3.client(
     's3',
-    verify=False
+    verify=False,
     endpoint_url=S3_ENDPOINT_URL,
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
