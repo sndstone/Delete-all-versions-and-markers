@@ -1,4 +1,4 @@
-# Import the required modules
+import argparse
 import boto3
 import json
 import logging
@@ -6,8 +6,34 @@ import threading
 import time  # Import the time module
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Set up argument parsing
+parser = argparse.ArgumentParser(description='Process some integers.')
+parser.add_argument('--logging', action='store_true', help='Enable debug logging to a file')
+parser.add_argument('--json_file_path', type=str, help='JSON file path for configuration')
+args = parser.parse_args()
+
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)  # Set root logger to DEBUG level
+
+# Create console handler with a higher log level
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)  # Set console handler to INFO level
+
+# Create formatters and add it to the handlers
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+
+# Add the handlers to the logger
+logger.addHandler(console_handler)
+
+if args.logging:
+    # Create file handler which logs even debug messages
+    file_handler = logging.FileHandler('debug.log')
+    file_handler.setLevel(logging.DEBUG)  # Set file handler to DEBUG level
+    file_handler.setFormatter(formatter)
+    # Add the handlers to the logger
+    logger.addHandler(file_handler)
 
 # Function to read credentials from JSON file
 def read_credentials_from_json(file_path):
@@ -16,24 +42,30 @@ def read_credentials_from_json(file_path):
             credentials = json.load(json_file)
             return credentials
     except Exception as e:
-        logging.error(f"Failed to read JSON file: {e}")
+        logger.error(f"Failed to read JSON file: {e}")
         exit(1)
 
 # Asks inputs to run run the script
-JSON_IMPORT = input("Do you want to import JSON file for configuration? (yes/no): ")
-
-if JSON_IMPORT.lower() == "yes":
-    JSON_FILE_PATH = input("Enter the JSON file path: ")
-    credentials = read_credentials_from_json(JSON_FILE_PATH)
+if args.json_file_path:
+    credentials = read_credentials_from_json(args.json_file_path)
     BUCKET_NAME = credentials.get("bucket_name")
     S3_ENDPOINT_URL = credentials.get("s3_endpoint_url")
     AWS_ACCESS_KEY_ID = credentials.get("aws_access_key_id")
     AWS_SECRET_ACCESS_KEY = credentials.get("aws_secret_access_key")
 else:
-    BUCKET_NAME = input("Enter the bucket name: ")
-    S3_ENDPOINT_URL = input("Enter the S3 endpoint URL, (EXAMPLE http://example.com:443): ")
-    AWS_ACCESS_KEY_ID = input("Enter the AWS access key ID: ")
-    AWS_SECRET_ACCESS_KEY = input("Enter the AWS secret access key: ")
+    JSON_IMPORT = input("Do you want to import JSON file for configuration? (yes/no): ")
+    if JSON_IMPORT.lower() == "yes":
+        JSON_FILE_PATH = input("Enter the JSON file path: ")
+        credentials = read_credentials_from_json(JSON_FILE_PATH)
+        BUCKET_NAME = credentials.get("bucket_name")
+        S3_ENDPOINT_URL = credentials.get("s3_endpoint_url")
+        AWS_ACCESS_KEY_ID = credentials.get("aws_access_key_id")
+        AWS_SECRET_ACCESS_KEY = credentials.get("aws_secret_access_key")
+    else:
+        BUCKET_NAME = input("Enter the bucket name: ")
+        S3_ENDPOINT_URL = input("Enter the S3 endpoint URL, (EXAMPLE http://example.com:443): ")
+        AWS_ACCESS_KEY_ID = input("Enter the AWS access key ID: ")
+        AWS_SECRET_ACCESS_KEY = input("Enter the AWS secret access key: ")
 
 # Define the S3 client
 try:
