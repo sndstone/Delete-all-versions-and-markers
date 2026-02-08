@@ -14,7 +14,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from botocore.config import Config
 from functools import partial
-from itertools import islice
+from itertools import islice, cycle
 
 # Set up argument parsing
 parser = argparse.ArgumentParser(description='High-performance S3 bucket cleanup tool.')
@@ -164,12 +164,14 @@ def create_s3_client():
 # Create a pool of S3 clients for better connection distribution
 s3_client_pool = [create_s3_client() for _ in range(min(20, args.max_workers))]
 s3_client = s3_client_pool[0]  # Main client for single operations
+s3_client_cycle = cycle(s3_client_pool)
+s3_client_cycle_lock = threading.Lock()
 
 # Function to get a client from the pool
 def get_s3_client():
-    # Round-robin client selection
-    client_idx = stats['delete_requests_sent'] % len(s3_client_pool)
-    return s3_client_pool[client_idx]
+    # Round-robin client selection with lock-protected cycle
+    with s3_client_cycle_lock:
+        return next(s3_client_cycle)
 
 # Function to handle graceful shutdown
 def signal_handler(sig, frame):
