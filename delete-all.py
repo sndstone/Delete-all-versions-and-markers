@@ -224,15 +224,6 @@ def status_reporter():
 async def list_object_versions(client, marker_batch_queue, version_batch_queue):
     """List object versions and feed them into the processing queue"""
     try:
-        # Create multiple paginators for better performance
-        paginators = [client.get_paginator('list_object_versions') for _ in range(min(5, args.max_workers // 10))]
-        
-        # Pagination parameters
-        pagination_config = {
-            'MaxItems': None,  # No limit to total items
-            'PageSize': args.list_max_keys,  # Maximum keys per page
-        }
-        
         # Get initial page to find if we need continuations
         initial_response = client.list_object_versions(
             Bucket=BUCKET_NAME,
@@ -276,27 +267,23 @@ async def list_object_versions(client, marker_batch_queue, version_batch_queue):
         
         # Check if we need to continue with pagination
         is_truncated = initial_response.get('IsTruncated', False)
+        key_marker = initial_response.get('NextKeyMarker')
+        version_id_marker = initial_response.get('NextVersionIdMarker')
         
         # If there are more objects to list
-        if is_truncated:
+        if is_truncated and key_marker and version_id_marker:
             logger.info("Initial page processed, continuing with pagination")
             
-            # Setup pagination iterator
-            paginator = paginators[0]
-            page_iterator = paginator.paginate(
-                Bucket=BUCKET_NAME,
-                PaginationConfig=pagination_config
-            )
-            
-            # Skip the first page as we've already processed it
             page_count = 1  # Start at 1 since we already processed initial page
-            
-            for page in page_iterator:
-                if page_count == 1:
-                    # Skip first page from paginator as we already processed it
-                    page_count += 1
-                    continue
-                    
+
+            while is_truncated and not stop_event.is_set():
+                page = client.list_object_versions(
+                    Bucket=BUCKET_NAME,
+                    MaxKeys=args.list_max_keys,
+                    KeyMarker=key_marker,
+                    VersionIdMarker=version_id_marker
+                )
+
                 page_count += 1
                 stats['list_requests'] += 1
                 
@@ -327,6 +314,10 @@ async def list_object_versions(client, marker_batch_queue, version_batch_queue):
                             stats['objects_found'] += len(version_batch)
                             logger.debug(f"Queued {len(version_batch)} versions for processing")
                             version_batch = []
+
+                is_truncated = page.get('IsTruncated', False)
+                key_marker = page.get('NextKeyMarker')
+                version_id_marker = page.get('NextVersionIdMarker')
                 
                 # Check if we need to stop
                 if stop_event.is_set():
