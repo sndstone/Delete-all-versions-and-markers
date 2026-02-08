@@ -403,7 +403,7 @@ def delete_object_batch(batch):
         return 0, 1
 
 # Worker function for deletion consumer
-async def deletion_worker(worker_id, queue):
+async def deletion_worker(worker_id, queue, executor):
     """Process batches from the deletion queue"""
     logger.debug(f"Deletion worker {worker_id} starting")
     
@@ -436,7 +436,7 @@ async def deletion_worker(worker_id, queue):
                 
             # Process this batch with the thread pool
             loop = asyncio.get_running_loop()
-            deleted, errors = await loop.run_in_executor(None, delete_object_batch, batch)
+            deleted, errors = await loop.run_in_executor(executor, delete_object_batch, batch)
             
             # Reset backoff on success
             if errors == 0:
@@ -485,75 +485,81 @@ async def process_bucket():
     # Create queues for object batches
     marker_queue = asyncio.Queue(maxsize=2000)  # Increased queue size for better buffering
     version_queue = asyncio.Queue(maxsize=2000)  # Increased queue size for better buffering
-    
+
     # Start status reporting thread
     status_thread = threading.Thread(target=status_reporter)
     status_thread.daemon = True
     status_thread.start()
-    
-    # Start listing task first if using immediate deletion
-    if args.immediate_deletion:
-        # Start listing task
-        listing_task = asyncio.create_task(list_object_versions(s3_client, marker_queue, version_queue))
-        
-        # Give listing a small head start to fill queues
-        await asyncio.sleep(0.5)
-        
-        # Start worker tasks for object deletion
-        deletion_workers = []
-        logger.info(f"Starting {args.max_workers} deletion workers with immediate processing")
-        
-        for i in range(args.max_workers):
-            # Distribute workers - more for versions if that's typically more common
-            queue_to_use = version_queue if i < (args.max_workers * 0.7) else marker_queue
-            worker = asyncio.create_task(deletion_worker(i, queue_to_use))
-            deletion_workers.append(worker)
-        
-        # Wait for listing to complete
-        await listing_task
-        logger.info("Object listing completed, waiting for deletion to finish")
-        
-        # Send termination signals to workers
-        for i in range(args.max_workers):
-            if i < (args.max_workers * 0.7):
-                await version_queue.put(None)
-            else:
+
+    executor = ThreadPoolExecutor(max_workers=args.max_workers)
+    try:
+        # Start listing task first if using immediate deletion
+        if args.immediate_deletion:
+            # Start listing task
+            listing_task = asyncio.create_task(list_object_versions(s3_client, marker_queue, version_queue))
+
+            # Give listing a small head start to fill queues
+            await asyncio.sleep(0.5)
+
+            # Start worker tasks for object deletion
+            deletion_workers = []
+            logger.info(f"Starting {args.max_workers} deletion workers with immediate processing")
+
+            for i in range(args.max_workers):
+                # Distribute workers - more for versions if that's typically more common
+                queue_to_use = version_queue if i < (args.max_workers * 0.7) else marker_queue
+                worker = asyncio.create_task(deletion_worker(i, queue_to_use, executor))
+                deletion_workers.append(worker)
+
+            # Wait for listing to complete
+            await listing_task
+            logger.info("Object listing completed, waiting for deletion to finish")
+
+            # Send termination signals to workers
+            for i in range(args.max_workers):
+                if i < (args.max_workers * 0.7):
+                    await version_queue.put(None)
+                else:
+                    await marker_queue.put(None)
+
+            # Wait for all tasks to complete
+            await asyncio.gather(*deletion_workers)
+
+            # Wait for queues to be fully processed
+            await marker_queue.join()
+            await version_queue.join()
+        else:
+            # Traditional approach - wait for listing to complete first
+            logger.info("Using traditional mode: listing all objects before deleting")
+
+            # Start listing task
+            listing_task = asyncio.create_task(list_object_versions(s3_client, marker_queue, version_queue))
+
+            # Wait for listing to complete
+            await listing_task
+
+            # Start worker tasks for object deletion
+            deletion_workers = []
+            for i in range(args.max_workers):
+                worker = asyncio.create_task(
+                    deletion_worker(i, marker_queue if i < args.max_workers/2 else version_queue, executor)
+                )
+                deletion_workers.append(worker)
+
+            # Send termination signals to workers when they're done
+            for _ in range(args.max_workers // 2):
                 await marker_queue.put(None)
-        
-        # Wait for all tasks to complete
-        await asyncio.gather(*deletion_workers)
-        
-        # Wait for queues to be fully processed
-        await marker_queue.join()
-        await version_queue.join()
-    else:
-        # Traditional approach - wait for listing to complete first
-        logger.info("Using traditional mode: listing all objects before deleting")
-        
-        # Start listing task
-        listing_task = asyncio.create_task(list_object_versions(s3_client, marker_queue, version_queue))
-        
-        # Wait for listing to complete
-        await listing_task
-        
-        # Start worker tasks for object deletion
-        deletion_workers = []
-        for i in range(args.max_workers):
-            worker = asyncio.create_task(deletion_worker(i, marker_queue if i < args.max_workers/2 else version_queue))
-            deletion_workers.append(worker)
-        
-        # Send termination signals to workers when they're done
-        for _ in range(args.max_workers // 2):
-            await marker_queue.put(None)
-        for _ in range(args.max_workers - args.max_workers // 2):
-            await version_queue.put(None)
-        
-        # Wait for all tasks to complete
-        await asyncio.gather(*deletion_workers)
-        
-        # Wait for queues to be fully processed
-        await marker_queue.join()
-        await version_queue.join()
+            for _ in range(args.max_workers - args.max_workers // 2):
+                await version_queue.put(None)
+
+            # Wait for all tasks to complete
+            await asyncio.gather(*deletion_workers)
+
+            # Wait for queues to be fully processed
+            await marker_queue.join()
+            await version_queue.join()
+    finally:
+        executor.shutdown(wait=True)
     
     # Calculate statistics
     end_time = time.time()
