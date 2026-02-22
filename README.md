@@ -40,12 +40,14 @@ python3 delete-all.py [options]
 | `--max_workers` | int | `50` | Maximum number of concurrent deletion worker threads. |
 | `--max_retries` | int | `5` | Maximum retry attempts for failed API calls. |
 | `--retry_mode` | string | `adaptive` | Retry mode for AWS API calls. Choices: `standard`, `adaptive`. |
-| `--max_requests_per_second` | int | `10000` | Maximum S3 API requests per second (currently unused in throttling logic). |
 | `--max_connections` | int | `1000` | Maximum concurrent connections in the connection pool. |
-| `--pipeline_size` | int | `50` | Number of simultaneous listing operations (currently unused in the listing logic). |
+| `--pipeline_size` | int | `50` | Maximum number of concurrent listing shards when `LIST_PREFIXES` is set. |
 | `--list_max_keys` | int | `1000` | Maximum keys per list request. |
-| `--immediate_deletion` | flag | on | Start deleting objects immediately while listing (enabled by default). |
+| `--immediate-deletion` | flag | on | Start deleting objects while listing (default behavior). |
+| `--no-immediate-deletion` | flag | off | List all objects first, then start deletion. |
 | `--deletion_delay` | float | `0` | Delay in seconds between deletion batches. |
+| `--max_passes` | int | `10` | Maximum full list+delete passes before exiting non-zero if objects remain. |
+| `--stable_empty_passes` | int | `2` | Consecutive empty verification passes required before declaring convergence. |
 
 ## Examples
 ### 1) Use interactive prompts
@@ -74,5 +76,7 @@ python3 delete-all.py \
 
 ## Notes
 - The tool deletes **every version** and **every delete marker** in the bucket, so it is destructive and irreversible.
-- `--max_requests_per_second` and `--pipeline_size` are parsed but currently not applied in the control flow.
+- `--max_requests_per_second` is still parsed but currently not applied in throttling logic.
+- Set `LIST_PREFIXES` (comma-separated prefixes) to enable multi-shard listing with `--pipeline_size` as the shard concurrency cap.
+- The script emits periodic throughput and backpressure metrics (pages/sec, queue fill, backlog depth, delete success/error rates).
 - If `--immediate_deletion` is enabled (default), deletion begins while listing is still in progress.
