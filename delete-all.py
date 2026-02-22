@@ -4,17 +4,12 @@ import json
 import logging
 import threading
 import time
-import os
-import multiprocessing
-import queue
 import asyncio
-import concurrent.futures
 import signal
 import sys
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from botocore.config import Config
-from functools import partial
-from itertools import islice, cycle
+from itertools import cycle
 
 # Set up argument parsing
 parser = argparse.ArgumentParser(description='High-performance S3 bucket cleanup tool.')
@@ -30,16 +25,15 @@ parser.add_argument('--max_retries', type=int, default=5,
                     help='Maximum number of retries for failed API calls (default: 5)')
 parser.add_argument('--retry_mode', type=str, choices=['standard', 'adaptive'], default='adaptive',
                     help='Retry mode for AWS API calls (default: adaptive)')
-parser.add_argument('--max_requests_per_second', type=int, default=10000,
-                    help='Maximum S3 API requests per second (default: 10000)')
 parser.add_argument('--max_connections', type=int, default=1000,
                     help='Maximum concurrent connections (default: 1000)')
-parser.add_argument('--pipeline_size', type=int, default=50,
-                    help='Number of simultaneous object listing operations (default: 50)')
 parser.add_argument('--list_max_keys', type=int, default=1000,
                     help='Maximum keys per list request (default: 1000)')
-parser.add_argument('--immediate_deletion', action='store_true', default=True,
-                    help='Start deleting objects immediately while listing (default: True)')
+parser.add_argument('--immediate-deletion', dest='immediate_deletion', action='store_true',
+                    help='Start deleting objects while listing (default)')
+parser.add_argument('--no-immediate-deletion', dest='immediate_deletion', action='store_false',
+                    help='List all objects first, then start deletion')
+parser.set_defaults(immediate_deletion=True)
 parser.add_argument('--deletion_delay', type=float, default=0,
                     help='Delay in seconds between deletion batches to avoid overwhelming the S3 service (default: 0)')
 args = parser.parse_args()
@@ -80,7 +74,6 @@ stats = {
 
 # Thread-safe counter for deletion rate limiting
 request_semaphore = threading.Semaphore(args.max_connections)
-deletion_queue = queue.Queue(maxsize=10000)  # Buffer for objects to delete
 stop_event = threading.Event()  # Event to signal script termination
 
 # Function to read credentials from JSON file
