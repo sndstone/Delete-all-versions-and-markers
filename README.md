@@ -41,6 +41,7 @@ python3 delete-all.py [options]
 | `--max_retries` | int | `5` | Maximum retry attempts for failed API calls. |
 | `--retry_mode` | string | `adaptive` | Retry mode for AWS API calls. Choices: `standard`, `adaptive`. |
 | `--max_connections` | int | `1000` | Maximum concurrent connections in the connection pool. |
+| `--pipeline_size` | int | `50` | Maximum number of concurrent listing shards when `LIST_PREFIXES` is set. |
 | `--list_max_keys` | int | `1000` | Maximum keys per list request. |
 | `--immediate-deletion` | flag | on | Start deleting objects while listing (default behavior). |
 | `--no-immediate-deletion` | flag | off | List all objects first, then start deletion. |
@@ -73,4 +74,7 @@ python3 delete-all.py \
 
 ## Notes
 - The tool deletes **every version** and **every delete marker** in the bucket, so it is destructive and irreversible.
-- If `--immediate-deletion` is enabled (default), deletion begins while listing is still in progress.
+- `--max_requests_per_second` is still parsed but currently not applied in throttling logic.
+- Set `LIST_PREFIXES` (comma-separated prefixes) to enable multi-shard listing with `--pipeline_size` as the shard concurrency cap.
+- The script emits periodic throughput and backpressure metrics (pages/sec, queue fill, backlog depth, delete success/error rates).
+- If `--immediate_deletion` is enabled (default), deletion begins while listing is still in progress.
