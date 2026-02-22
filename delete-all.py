@@ -42,7 +42,16 @@ parser.add_argument('--immediate_deletion', action='store_true', default=True,
                     help='Start deleting objects immediately while listing (default: True)')
 parser.add_argument('--deletion_delay', type=float, default=0,
                     help='Delay in seconds between deletion batches to avoid overwhelming the S3 service (default: 0)')
+parser.add_argument('--max_passes', type=int, default=10,
+                    help='Maximum full list+delete passes before exiting with an error if objects remain (default: 10)')
+parser.add_argument('--stable_empty_passes', type=int, default=2,
+                    help='Consecutive empty verification passes required before declaring convergence (default: 2)')
 args = parser.parse_args()
+
+if args.max_passes < 1:
+    parser.error('--max_passes must be at least 1')
+if args.stable_empty_passes < 1:
+    parser.error('--stable_empty_passes must be at least 1')
 
 # Set up logging
 logger = logging.getLogger()
@@ -462,27 +471,27 @@ async def deletion_worker(worker_id, queue, executor):
     
     logger.debug(f"Deletion worker {worker_id} stopping")
 
-# Main async processing function
-async def process_bucket():
-    """Main async function to orchestrate the bucket processing"""
-    logger.info(f"Starting high-performance S3 bucket cleanup for {BUCKET_NAME}")
-    logger.info(f"Configuration: batch_size={args.batch_size}, max_workers={args.max_workers}, "
-                f"max_connections={args.max_connections}, immediate_deletion={args.immediate_deletion}")
-    
-    if args.checksum:
-        logger.info(f"Using {args.checksum} checksum algorithm for S3 operations")
-    
-    # Set start time for statistics
-    stats['start_time'] = time.time()
-    
+def verify_remaining_objects(client):
+    """Run a lightweight verification listing and return total items seen in that check."""
+    try:
+        response = client.list_object_versions(
+            Bucket=BUCKET_NAME,
+            MaxKeys=args.list_max_keys
+        )
+        stats['list_requests'] += 1
+        return len(response.get('Versions', [])) + len(response.get('DeleteMarkers', []))
+    except Exception as e:
+        logger.error(f"Verification listing failed: {e}")
+        return -1
+
+
+async def run_cleanup_pass(pass_number):
+    """Run one full list+delete pass."""
+    logger.info(f"Starting cleanup pass {pass_number}/{args.max_passes}")
+
     # Create queues for object batches
     marker_queue = asyncio.Queue(maxsize=2000)  # Increased queue size for better buffering
     version_queue = asyncio.Queue(maxsize=2000)  # Increased queue size for better buffering
-
-    # Start status reporting thread
-    status_thread = threading.Thread(target=status_reporter)
-    status_thread.daemon = True
-    status_thread.start()
 
     executor = ThreadPoolExecutor(max_workers=args.max_workers)
     try:
@@ -553,6 +562,57 @@ async def process_bucket():
             await version_queue.join()
     finally:
         executor.shutdown(wait=True)
+
+# Main async processing function
+async def process_bucket():
+    """Main async function to orchestrate the bucket processing"""
+    logger.info(f"Starting high-performance S3 bucket cleanup for {BUCKET_NAME}")
+    logger.info(f"Configuration: batch_size={args.batch_size}, max_workers={args.max_workers}, "
+                f"max_connections={args.max_connections}, immediate_deletion={args.immediate_deletion}")
+    
+    if args.checksum:
+        logger.info(f"Using {args.checksum} checksum algorithm for S3 operations")
+    
+    # Set start time for statistics
+    stats['start_time'] = time.time()
+    
+    # Start status reporting thread
+    status_thread = threading.Thread(target=status_reporter)
+    status_thread.daemon = True
+    status_thread.start()
+
+    stable_empty_pass_count = 0
+    remaining_items = -1
+
+    for pass_number in range(1, args.max_passes + 1):
+        if stop_event.is_set():
+            break
+
+        await run_cleanup_pass(pass_number)
+
+        remaining_items = verify_remaining_objects(s3_client)
+        if remaining_items < 0:
+            logger.error("Unable to verify remaining objects after pass; aborting cleanup")
+            return 1
+
+        if remaining_items == 0:
+            stable_empty_pass_count += 1
+            logger.info(
+                f"Verification pass is empty ({stable_empty_pass_count}/{args.stable_empty_passes} consecutive)"
+            )
+            if stable_empty_pass_count >= args.stable_empty_passes:
+                logger.info("Reached stable empty verification threshold; stopping cleanup passes")
+                break
+        else:
+            logger.info(f"Verification found {remaining_items} objects still present after pass {pass_number}")
+            stable_empty_pass_count = 0
+
+    if remaining_items > 0 and stable_empty_pass_count < args.stable_empty_passes:
+        logger.error(
+            f"Cleanup did not converge after {args.max_passes} passes. "
+            f"Remaining objects visible in verification: {remaining_items}"
+        )
+        return 1
     
     # Calculate statistics
     end_time = time.time()

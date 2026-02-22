@@ -46,6 +46,8 @@ python3 delete-all.py [options]
 | `--list_max_keys` | int | `1000` | Maximum keys per list request. |
 | `--immediate_deletion` | flag | on | Start deleting objects immediately while listing (enabled by default). |
 | `--deletion_delay` | float | `0` | Delay in seconds between deletion batches. |
+| `--max_passes` | int | `10` | Maximum full list+delete passes before exiting non-zero if objects remain. |
+| `--stable_empty_passes` | int | `2` | Consecutive empty verification passes required before declaring convergence. |
 
 ## Examples
 ### 1) Use interactive prompts
@@ -74,5 +76,9 @@ python3 delete-all.py \
 
 ## Notes
 - The tool deletes **every version** and **every delete marker** in the bucket, so it is destructive and irreversible.
+
+- Cleanup now runs as **best-effort convergence under concurrent writers**: it performs repeated full list+delete passes, then runs a verification listing after each pass.
+- The script stops when verification is empty for `--stable_empty_passes` consecutive passes (default `2`).
+- If verification still shows objects after `--max_passes` (default `10`), the script exits with a non-zero status and logs the remaining count summary.
 - `--max_requests_per_second` and `--pipeline_size` are parsed but currently not applied in the control flow.
 - If `--immediate_deletion` is enabled (default), deletion begins while listing is still in progress.
