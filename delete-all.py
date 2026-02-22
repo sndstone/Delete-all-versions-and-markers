@@ -346,9 +346,6 @@ async def list_object_versions(client, marker_batch_queue, version_batch_queue):
         logger.error(f"Error listing object versions: {e}")
         logger.exception("Exception details:")
     finally:
-        # Signal completion
-        await marker_batch_queue.put(None)
-        await version_batch_queue.put(None)
         logger.info(f"Finished listing objects, found {stats['objects_found']} objects")
 
 # Function to delete objects in batch
@@ -486,6 +483,37 @@ async def process_bucket():
 
     executor = ThreadPoolExecutor(max_workers=args.max_workers)
     try:
+        if args.immediate_deletion:
+            version_worker_count = int(args.max_workers * 0.7)
+        else:
+            version_worker_count = args.max_workers - (args.max_workers // 2)
+        marker_worker_count = args.max_workers - version_worker_count
+
+        logger.info(
+            "Worker assignment: version_workers=%s, marker_workers=%s",
+            version_worker_count,
+            marker_worker_count,
+        )
+
+        async def wait_for_queue_drain(marker_sentinels_sent, version_sentinels_sent):
+            logger.info(
+                "Shutdown: sent sentinel signals (marker=%s, version=%s)",
+                marker_sentinels_sent,
+                version_sentinels_sent,
+            )
+            logger.info(
+                "Shutdown: queue sizes before join (marker=%s, version=%s)",
+                marker_queue.qsize(),
+                version_queue.qsize(),
+            )
+            await marker_queue.join()
+            await version_queue.join()
+            logger.info(
+                "Shutdown: queue sizes after join (marker=%s, version=%s)",
+                marker_queue.qsize(),
+                version_queue.qsize(),
+            )
+
         # Start listing task first if using immediate deletion
         if args.immediate_deletion:
             # Start listing task
@@ -499,8 +527,7 @@ async def process_bucket():
             logger.info(f"Starting {args.max_workers} deletion workers with immediate processing")
 
             for i in range(args.max_workers):
-                # Distribute workers - more for versions if that's typically more common
-                queue_to_use = version_queue if i < (args.max_workers * 0.7) else marker_queue
+                queue_to_use = version_queue if i < version_worker_count else marker_queue
                 worker = asyncio.create_task(deletion_worker(i, queue_to_use, executor))
                 deletion_workers.append(worker)
 
@@ -509,18 +536,16 @@ async def process_bucket():
             logger.info("Object listing completed, waiting for deletion to finish")
 
             # Send termination signals to workers
-            for i in range(args.max_workers):
-                if i < (args.max_workers * 0.7):
-                    await version_queue.put(None)
-                else:
-                    await marker_queue.put(None)
+            for _ in range(marker_worker_count):
+                await marker_queue.put(None)
+            for _ in range(version_worker_count):
+                await version_queue.put(None)
 
             # Wait for all tasks to complete
             await asyncio.gather(*deletion_workers)
 
             # Wait for queues to be fully processed
-            await marker_queue.join()
-            await version_queue.join()
+            await wait_for_queue_drain(marker_worker_count, version_worker_count)
         else:
             # Traditional approach - wait for listing to complete first
             logger.info("Using traditional mode: listing all objects before deleting")
@@ -535,22 +560,21 @@ async def process_bucket():
             deletion_workers = []
             for i in range(args.max_workers):
                 worker = asyncio.create_task(
-                    deletion_worker(i, marker_queue if i < args.max_workers/2 else version_queue, executor)
+                    deletion_worker(i, marker_queue if i < marker_worker_count else version_queue, executor)
                 )
                 deletion_workers.append(worker)
 
             # Send termination signals to workers when they're done
-            for _ in range(args.max_workers // 2):
+            for _ in range(marker_worker_count):
                 await marker_queue.put(None)
-            for _ in range(args.max_workers - args.max_workers // 2):
+            for _ in range(version_worker_count):
                 await version_queue.put(None)
 
             # Wait for all tasks to complete
             await asyncio.gather(*deletion_workers)
 
             # Wait for queues to be fully processed
-            await marker_queue.join()
-            await version_queue.join()
+            await wait_for_queue_drain(marker_worker_count, version_worker_count)
     finally:
         executor.shutdown(wait=True)
     
