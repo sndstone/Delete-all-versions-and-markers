@@ -313,6 +313,8 @@ async def list_object_versions(client, marker_batch_queue, version_batch_queue, 
     except Exception as e:
         logger.error(f"Error listing object versions for prefix {prefix!r}: {e}")
         logger.exception("Exception details:")
+    finally:
+        logger.info(f"Finished listing objects, found {stats['objects_found']} objects")
 
 # Function to delete objects in batch
 def delete_object_batch(batch):
@@ -519,44 +521,101 @@ async def process_bucket():
     with stats_lock:
         stats['start_time'] = time.time()
 
-    queue_depth = max(100, args.pipeline_size * 20)
-    marker_queue = asyncio.Queue(maxsize=queue_depth)
-    version_queue = asyncio.Queue(maxsize=queue_depth)
+    executor = ThreadPoolExecutor(max_workers=args.max_workers)
+    try:
+        if args.immediate_deletion:
+            version_worker_count = int(args.max_workers * 0.7)
+        else:
+            version_worker_count = args.max_workers - (args.max_workers // 2)
+        marker_worker_count = args.max_workers - version_worker_count
 
-    status_thread = threading.Thread(target=status_reporter, args=(marker_queue, version_queue), daemon=True)
-    status_thread.start()
+        logger.info(
+            "Worker assignment: version_workers=%s, marker_workers=%s",
+            version_worker_count,
+            marker_worker_count,
+        )
+
+        async def wait_for_queue_drain(marker_sentinels_sent, version_sentinels_sent):
+            logger.info(
+                "Shutdown: sent sentinel signals (marker=%s, version=%s)",
+                marker_sentinels_sent,
+                version_sentinels_sent,
+            )
+            logger.info(
+                "Shutdown: queue sizes before join (marker=%s, version=%s)",
+                marker_queue.qsize(),
+                version_queue.qsize(),
+            )
+            await marker_queue.join()
+            await version_queue.join()
+            logger.info(
+                "Shutdown: queue sizes after join (marker=%s, version=%s)",
+                marker_queue.qsize(),
+                version_queue.qsize(),
+            )
+
+        # Start listing task first if using immediate deletion
+        if args.immediate_deletion:
+            # Start listing task
+            listing_task = asyncio.create_task(list_object_versions(s3_client, marker_queue, version_queue))
+
+            # Give listing a small head start to fill queues
+            await asyncio.sleep(0.5)
+
+            # Start worker tasks for object deletion
+            deletion_workers = []
+            logger.info(f"Starting {args.max_workers} deletion workers with immediate processing")
+
+            for i in range(args.max_workers):
+                queue_to_use = version_queue if i < version_worker_count else marker_queue
+                worker = asyncio.create_task(deletion_worker(i, queue_to_use, executor))
+                deletion_workers.append(worker)
+
+            # Wait for listing to complete
+            await listing_task
+            logger.info("Object listing completed, waiting for deletion to finish")
+
+            # Send termination signals to workers
+            for _ in range(marker_worker_count):
+                await marker_queue.put(None)
+            for _ in range(version_worker_count):
+                await version_queue.put(None)
+
+            # Wait for all tasks to complete
+            await asyncio.gather(*deletion_workers)
+
+            # Wait for queues to be fully processed
+            await wait_for_queue_drain(marker_worker_count, version_worker_count)
+        else:
+            # Traditional approach - wait for listing to complete first
+            logger.info("Using traditional mode: listing all objects before deleting")
+
+            # Start listing task
+            listing_task = asyncio.create_task(list_object_versions(s3_client, marker_queue, version_queue))
+
+            # Wait for listing to complete
+            await listing_task
+
+            # Start worker tasks for object deletion
+            deletion_workers = []
+            for i in range(args.max_workers):
+                worker = asyncio.create_task(
+                    deletion_worker(i, marker_queue if i < marker_worker_count else version_queue, executor)
+                )
+                deletion_workers.append(worker)
+
+            # Send termination signals to workers when they're done
+            for _ in range(marker_worker_count):
+                await marker_queue.put(None)
+            for _ in range(version_worker_count):
+                await version_queue.put(None)
 
     prefixes = get_listing_prefixes()
     active_listers = min(len(prefixes), max(1, args.pipeline_size))
     logger.info(f"Listing shards: {active_listers} (LIST_PREFIXES={'enabled' if prefixes != [None] else 'disabled'})")
 
-    executor = ThreadPoolExecutor(max_workers=args.max_workers)
-    try:
-        deletion_workers = []
-        marker_workers = max(1, args.max_workers // 3)
-        version_workers = max(1, args.max_workers - marker_workers)
-
-        for i in range(version_workers):
-            deletion_workers.append(asyncio.create_task(deletion_worker(i, version_queue, executor)))
-        for i in range(marker_workers):
-            deletion_workers.append(asyncio.create_task(deletion_worker(version_workers + i, marker_queue, executor)))
-
-        listing_tasks = []
-        for idx, prefix in enumerate(prefixes[:active_listers]):
-            client = s3_client_pool[idx % len(s3_client_pool)]
-            listing_tasks.append(asyncio.create_task(list_object_versions(client, marker_queue, version_queue, prefix=prefix)))
-
-        await asyncio.gather(*listing_tasks)
-        logger.info("Object listing completed, draining deletion queues")
-
-        for _ in range(marker_workers):
-            await marker_queue.put(None)
-        for _ in range(version_workers):
-            await version_queue.put(None)
-
-        await asyncio.gather(*deletion_workers)
-        await marker_queue.join()
-        await version_queue.join()
+            # Wait for queues to be fully processed
+            await wait_for_queue_drain(marker_worker_count, version_worker_count)
     finally:
         executor.shutdown(wait=True)
         stop_event.set()
