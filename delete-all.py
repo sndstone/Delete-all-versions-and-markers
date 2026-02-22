@@ -359,41 +359,82 @@ def delete_object_batch(batch):
         
     # Get a client from the pool
     client = get_s3_client()
+    pending_objects = list(batch)
+    total_deleted = 0
     
     try:
-        with request_semaphore:
-            result = client.delete_objects(
-                Bucket=BUCKET_NAME,
-                Delete={
-                    'Objects': batch,
-                    'Quiet': True
-                }
-            )
-            
-            # Update stats
+        for retry_attempt in range(args.max_retries + 1):
+            with request_semaphore:
+                result = client.delete_objects(
+                    Bucket=BUCKET_NAME,
+                    Delete={
+                        'Objects': pending_objects,
+                        'Quiet': False
+                    }
+                )
+
             stats['delete_requests_sent'] += 1
-            deleted_count = len(batch)
+
+            deleted_items = result.get('Deleted', [])
+            deleted_count = len(deleted_items)
+            total_deleted += deleted_count
             stats['objects_deleted'] += deleted_count
-            
-            # Check for errors
-            error_count = 0
-            if 'Errors' in result and result['Errors']:
-                error_count = len(result['Errors'])
-                stats['delete_errors'] += error_count
-                
-                # Only log a sample of errors to avoid flooding logs
-                if error_count > 0 and stats['delete_errors'] % 100 == 1:
-                    for i, error in enumerate(result['Errors'][:5]):  # Log at most 5 errors
-                        logger.error(f"Delete error: {error}")
-                    if error_count > 5:
-                        logger.error(f"... and {error_count - 5} more errors")
-            
-            return deleted_count, error_count
-            
+
+            errors = result.get('Errors', [])
+            if not errors:
+                return total_deleted, 0
+
+            pending_by_id = {
+                (obj.get('Key'), obj.get('VersionId')): obj
+                for obj in pending_objects
+            }
+
+            failed_objects = []
+            for error in errors:
+                failed_object = pending_by_id.get((error.get('Key'), error.get('VersionId')))
+                if failed_object is None:
+                    failed_object = {
+                        'Key': error.get('Key'),
+                        'VersionId': error.get('VersionId')
+                    }
+                failed_objects.append(failed_object)
+
+            if retry_attempt >= args.max_retries:
+                final_error_count = len(failed_objects)
+                stats['delete_errors'] += final_error_count
+                for error, failed_object in zip(errors, failed_objects):
+                    logger.error(
+                        "Unresolved delete failure: key=%s version=%s code=%s message=%s",
+                        failed_object.get('Key'),
+                        failed_object.get('VersionId'),
+                        error.get('Code', 'Unknown'),
+                        error.get('Message', '')
+                    )
+                return total_deleted, final_error_count
+
+            sleep_seconds = min(5, 0.1 * (2 ** retry_attempt))
+            logger.warning(
+                "Retrying %s failed object deletions (attempt %s/%s) in %.2fs",
+                len(failed_objects),
+                retry_attempt + 1,
+                args.max_retries,
+                sleep_seconds
+            )
+            time.sleep(sleep_seconds)
+            pending_objects = failed_objects
+
     except Exception as e:
         logger.error(f"Batch deletion error: {e}")
-        stats['delete_errors'] += 1
-        return 0, 1
+        unresolved_errors = len(pending_objects)
+        stats['delete_errors'] += unresolved_errors
+        for failed_object in pending_objects:
+            logger.error(
+                "Unresolved delete failure after exception: key=%s version=%s code=%s",
+                failed_object.get('Key'),
+                failed_object.get('VersionId'),
+                'Exception'
+            )
+        return total_deleted, unresolved_errors
 
 # Worker function for deletion consumer
 async def deletion_worker(worker_id, queue, executor):
