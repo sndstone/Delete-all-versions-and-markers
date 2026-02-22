@@ -40,11 +40,11 @@ python3 delete-all.py [options]
 | `--max_workers` | int | `50` | Maximum number of concurrent deletion worker threads. |
 | `--max_retries` | int | `5` | Maximum retry attempts for failed API calls. |
 | `--retry_mode` | string | `adaptive` | Retry mode for AWS API calls. Choices: `standard`, `adaptive`. |
-| `--max_requests_per_second` | int | `10000` | Maximum S3 API requests per second (currently unused in throttling logic). |
 | `--max_connections` | int | `1000` | Maximum concurrent connections in the connection pool. |
 | `--pipeline_size` | int | `50` | Maximum number of concurrent listing shards when `LIST_PREFIXES` is set. |
 | `--list_max_keys` | int | `1000` | Maximum keys per list request. |
-| `--immediate_deletion` | flag | on | Start deleting objects immediately while listing (enabled by default). |
+| `--immediate-deletion` | flag | on | Start deleting objects while listing (default behavior). |
+| `--no-immediate-deletion` | flag | off | List all objects first, then start deletion. |
 | `--deletion_delay` | float | `0` | Delay in seconds between deletion batches. |
 
 ## Examples
