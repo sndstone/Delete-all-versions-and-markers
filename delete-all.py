@@ -35,7 +35,7 @@ parser.add_argument('--max_requests_per_second', type=int, default=10000,
 parser.add_argument('--max_connections', type=int, default=1000,
                     help='Maximum concurrent connections (default: 1000)')
 parser.add_argument('--pipeline_size', type=int, default=50,
-                    help='Number of simultaneous object listing operations (default: 50)')
+                    help='Maximum concurrent listing shards when LIST_PREFIXES env var is provided (default: 50)')
 parser.add_argument('--list_max_keys', type=int, default=1000,
                     help='Maximum keys per list request (default: 1000)')
 parser.add_argument('--immediate_deletion', action='store_true', default=True,
@@ -72,16 +72,29 @@ if args.debug:
 stats = {
     'delete_requests_sent': 0,
     'objects_deleted': 0,
+    'delete_attempted': 0,
     'delete_errors': 0,
+    'pages_listed': 0,
     'list_requests': 0,
     'objects_found': 0,
+    'list_backpressure_events': 0,
     'start_time': 0
 }
+stats_lock = threading.Lock()
 
 # Thread-safe counter for deletion rate limiting
 request_semaphore = threading.Semaphore(args.max_connections)
-deletion_queue = queue.Queue(maxsize=10000)  # Buffer for objects to delete
 stop_event = threading.Event()  # Event to signal script termination
+
+
+def increment_stat(name, value=1):
+    with stats_lock:
+        stats[name] += value
+
+
+def get_stats_snapshot():
+    with stats_lock:
+        return dict(stats)
 
 # Function to read credentials from JSON file
 def read_credentials_from_json(file_path):
@@ -182,174 +195,122 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+def get_listing_prefixes():
+    """Return explicit listing shard prefixes, bounded by --pipeline_size."""
+    raw_prefixes = os.environ.get('LIST_PREFIXES', '')
+    if not raw_prefixes.strip():
+        return [None]
+
+    prefixes = [p.strip() for p in raw_prefixes.split(',') if p.strip()]
+    if not prefixes:
+        return [None]
+
+    return prefixes[:max(1, args.pipeline_size)]
+
+
+async def queue_batch(output_queue, batch):
+    """Put a batch into a bounded queue while tracking backpressure."""
+    if output_queue.full():
+        increment_stat('list_backpressure_events')
+    await output_queue.put(batch)
+
+
 # Function to print status periodically
-def status_reporter():
-    last_objects_deleted = 0
+def status_reporter(marker_queue, version_queue):
     last_time = time.time()
-    
+    last_pages = 0
+    last_deleted = 0
+
     while not stop_event.is_set():
-        time.sleep(5)  # Update every 5 seconds
-        
+        time.sleep(5)
+
         current_time = time.time()
         elapsed = current_time - last_time
-        deleted_since_last = stats['objects_deleted'] - last_objects_deleted
-        
-        if elapsed > 0:
-            delete_rate = deleted_since_last / elapsed
-            total_elapsed = current_time - stats['start_time'] if stats['start_time'] > 0 else 0
-            
-            if total_elapsed > 0:
-                avg_rate = stats['objects_deleted'] / total_elapsed
-                
-                # Calculate ETA if we know the total objects
-                if stats['objects_found'] > 0:
-                    remaining = stats['objects_found'] - stats['objects_deleted']
-                    eta_seconds = remaining / avg_rate if avg_rate > 0 else 0
-                    eta_mins = int(eta_seconds / 60)
-                    eta_secs = int(eta_seconds % 60)
-                    eta_str = f", ETA: {eta_mins}m {eta_secs}s"
-                else:
-                    eta_str = ""
-                
-                # Print status with current and average rates
-                logger.info(f"Status: Deleted {stats['objects_deleted']:,}/{stats['objects_found']:,} objects "
-                          f"({stats['delete_errors']} errors) - "
-                          f"Current rate: {delete_rate:.1f}/s, Average: {avg_rate:.1f}/s"
-                          f"{eta_str}")
-            
-        last_objects_deleted = stats['objects_deleted']
+        snapshot = get_stats_snapshot()
+
+        pages_delta = snapshot['pages_listed'] - last_pages
+        deleted_delta = snapshot['objects_deleted'] - last_deleted
+        page_rate = pages_delta / elapsed if elapsed > 0 else 0
+        delete_rate = deleted_delta / elapsed if elapsed > 0 else 0
+
+        marker_fill = marker_queue.qsize() / marker_queue.maxsize if marker_queue.maxsize else 0
+        version_fill = version_queue.qsize() / version_queue.maxsize if version_queue.maxsize else 0
+
+        delete_success_rate = 0
+        if snapshot['delete_attempted'] > 0:
+            delete_success_rate = (snapshot['objects_deleted'] / snapshot['delete_attempted']) * 100
+
+        logger.info(
+            "Metrics: pages=%s (%.2f/s), listed=%s, deleted=%s (%.1f/s), delete_errors=%s, "
+            "delete_success=%.2f%%, backlog(marker=%s, version=%s), queue_fill(marker=%.1f%%, version=%.1f%%), "
+            "backpressure_events=%s",
+            f"{snapshot['pages_listed']:,}",
+            page_rate,
+            f"{snapshot['objects_found']:,}",
+            f"{snapshot['objects_deleted']:,}",
+            delete_rate,
+            f"{snapshot['delete_errors']:,}",
+            delete_success_rate,
+            marker_queue.qsize(),
+            version_queue.qsize(),
+            marker_fill * 100,
+            version_fill * 100,
+            snapshot['list_backpressure_events'],
+        )
+
+        last_pages = snapshot['pages_listed']
+        last_deleted = snapshot['objects_deleted']
         last_time = current_time
 
+
 # Function to list object versions efficiently
-async def list_object_versions(client, marker_batch_queue, version_batch_queue):
-    """List object versions and feed them into the processing queue"""
+async def list_object_versions(client, marker_batch_queue, version_batch_queue, prefix=None):
+    """List object versions via paginator and stream batches to queues."""
+    paginator = client.get_paginator('list_object_versions')
+    pagination_config = {'PageSize': args.list_max_keys}
+    operation_params = {'Bucket': BUCKET_NAME, 'PaginationConfig': pagination_config}
+    if prefix is not None:
+        operation_params['Prefix'] = prefix
+
+    marker_batch = []
+    version_batch = []
+
     try:
-        # Get initial page to find if we need continuations
-        initial_response = client.list_object_versions(
-            Bucket=BUCKET_NAME,
-            MaxKeys=args.list_max_keys
-        )
-        
-        # Process initial page
-        version_batch = []
-        marker_batch = []
-        stats['list_requests'] += 1
-        
-        # Process delete markers from initial page
-        if 'DeleteMarkers' in initial_response:
-            for marker in initial_response['DeleteMarkers']:
-                marker_batch.append({
-                    'Key': marker['Key'],
-                    'VersionId': marker['VersionId']
-                })
-                
-                # Send batch immediately if full
+        for page in paginator.paginate(**operation_params):
+            if stop_event.is_set():
+                break
+
+            increment_stat('list_requests')
+            increment_stat('pages_listed')
+
+            for marker in page.get('DeleteMarkers', []):
+                marker_batch.append({'Key': marker['Key'], 'VersionId': marker['VersionId']})
                 if len(marker_batch) >= args.batch_size:
-                    await marker_batch_queue.put(marker_batch.copy())
-                    stats['objects_found'] += len(marker_batch)
-                    logger.debug(f"Queued {len(marker_batch)} delete markers for processing")
+                    await queue_batch(marker_batch_queue, marker_batch)
+                    increment_stat('objects_found', len(marker_batch))
                     marker_batch = []
-        
-        # Process object versions from initial page
-        if 'Versions' in initial_response:
-            for version in initial_response['Versions']:
-                version_batch.append({
-                    'Key': version['Key'],
-                    'VersionId': version['VersionId']
-                })
-                
-                # Send batch immediately if full
+
+            for version in page.get('Versions', []):
+                version_batch.append({'Key': version['Key'], 'VersionId': version['VersionId']})
                 if len(version_batch) >= args.batch_size:
-                    await version_batch_queue.put(version_batch.copy())
-                    stats['objects_found'] += len(version_batch)
-                    logger.debug(f"Queued {len(version_batch)} versions for processing")
+                    await queue_batch(version_batch_queue, version_batch)
+                    increment_stat('objects_found', len(version_batch))
                     version_batch = []
-        
-        # Check if we need to continue with pagination
-        is_truncated = initial_response.get('IsTruncated', False)
-        key_marker = initial_response.get('NextKeyMarker')
-        version_id_marker = initial_response.get('NextVersionIdMarker')
-        
-        # If there are more objects to list
-        if is_truncated and key_marker and version_id_marker:
-            logger.info("Initial page processed, continuing with pagination")
-            
-            page_count = 1  # Start at 1 since we already processed initial page
 
-            while is_truncated and not stop_event.is_set():
-                page = client.list_object_versions(
-                    Bucket=BUCKET_NAME,
-                    MaxKeys=args.list_max_keys,
-                    KeyMarker=key_marker,
-                    VersionIdMarker=version_id_marker
-                )
+            if args.deletion_delay > 0:
+                await asyncio.sleep(args.deletion_delay)
 
-                page_count += 1
-                stats['list_requests'] += 1
-                
-                # Process delete markers
-                if 'DeleteMarkers' in page:
-                    for marker in page['DeleteMarkers']:
-                        marker_batch.append({
-                            'Key': marker['Key'],
-                            'VersionId': marker['VersionId']
-                        })
-                        
-                        if len(marker_batch) >= args.batch_size:
-                            await marker_batch_queue.put(marker_batch.copy())
-                            stats['objects_found'] += len(marker_batch)
-                            logger.debug(f"Queued {len(marker_batch)} delete markers for processing")
-                            marker_batch = []
-                
-                # Process object versions
-                if 'Versions' in page:
-                    for version in page['Versions']:
-                        version_batch.append({
-                            'Key': version['Key'],
-                            'VersionId': version['VersionId']
-                        })
-                        
-                        if len(version_batch) >= args.batch_size:
-                            await version_batch_queue.put(version_batch.copy())
-                            stats['objects_found'] += len(version_batch)
-                            logger.debug(f"Queued {len(version_batch)} versions for processing")
-                            version_batch = []
-
-                is_truncated = page.get('IsTruncated', False)
-                key_marker = page.get('NextKeyMarker')
-                version_id_marker = page.get('NextVersionIdMarker')
-                
-                # Check if we need to stop
-                if stop_event.is_set():
-                    break
-                    
-                # Log progress periodically
-                if page_count % 10 == 0:
-                    logger.debug(f"Listed {page_count} pages of objects")
-                    
-                # Apply small delay if requested to avoid overwhelming S3
-                if args.deletion_delay > 0:
-                    await asyncio.sleep(args.deletion_delay)
-        
-        # Put any remaining batches in the queue
         if marker_batch:
-            await marker_batch_queue.put(marker_batch)
-            stats['objects_found'] += len(marker_batch)
-            logger.debug(f"Queued final {len(marker_batch)} delete markers for processing")
-            
+            await queue_batch(marker_batch_queue, marker_batch)
+            increment_stat('objects_found', len(marker_batch))
+
         if version_batch:
-            await version_batch_queue.put(version_batch)
-            stats['objects_found'] += len(version_batch)
-            logger.debug(f"Queued final {len(version_batch)} versions for processing")
-            
+            await queue_batch(version_batch_queue, version_batch)
+            increment_stat('objects_found', len(version_batch))
+
     except Exception as e:
-        logger.error(f"Error listing object versions: {e}")
+        logger.error(f"Error listing object versions for prefix {prefix!r}: {e}")
         logger.exception("Exception details:")
-    finally:
-        # Signal completion
-        await marker_batch_queue.put(None)
-        await version_batch_queue.put(None)
-        logger.info(f"Finished listing objects, found {stats['objects_found']} objects")
 
 # Function to delete objects in batch
 def delete_object_batch(batch):
@@ -371,18 +332,19 @@ def delete_object_batch(batch):
             )
             
             # Update stats
-            stats['delete_requests_sent'] += 1
+            increment_stat('delete_requests_sent')
             deleted_count = len(batch)
-            stats['objects_deleted'] += deleted_count
+            increment_stat('delete_attempted', deleted_count)
+            increment_stat('objects_deleted', deleted_count)
             
             # Check for errors
             error_count = 0
             if 'Errors' in result and result['Errors']:
                 error_count = len(result['Errors'])
-                stats['delete_errors'] += error_count
+                increment_stat('delete_errors', error_count)
                 
                 # Only log a sample of errors to avoid flooding logs
-                if error_count > 0 and stats['delete_errors'] % 100 == 1:
+                if error_count > 0 and get_stats_snapshot()['delete_errors'] % 100 == 1:
                     for i, error in enumerate(result['Errors'][:5]):  # Log at most 5 errors
                         logger.error(f"Delete error: {error}")
                     if error_count > 5:
@@ -392,7 +354,7 @@ def delete_object_batch(batch):
             
     except Exception as e:
         logger.error(f"Batch deletion error: {e}")
-        stats['delete_errors'] += 1
+        increment_stat('delete_errors')
         return 0, 1
 
 # Worker function for deletion consumer
@@ -414,7 +376,7 @@ async def deletion_worker(worker_id, queue, executor):
                 batch = await asyncio.wait_for(queue.get(), timeout=2.0)
             except asyncio.TimeoutError:
                 # If we've been waiting too long, check if listing is complete
-                if queue.empty() and stats['list_requests'] > 0:
+                if queue.empty() and get_stats_snapshot()['list_requests'] > 0:
                     logger.debug(f"Worker {worker_id} timed out waiting for items, checking if we're done")
                     # Allow worker to exit if there are no more items expected
                     continue
@@ -464,109 +426,73 @@ async def deletion_worker(worker_id, queue, executor):
 
 # Main async processing function
 async def process_bucket():
-    """Main async function to orchestrate the bucket processing"""
+    """Main async function to orchestrate bounded producer-consumer processing."""
     logger.info(f"Starting high-performance S3 bucket cleanup for {BUCKET_NAME}")
     logger.info(f"Configuration: batch_size={args.batch_size}, max_workers={args.max_workers}, "
-                f"max_connections={args.max_connections}, immediate_deletion={args.immediate_deletion}")
-    
+                f"max_connections={args.max_connections}, immediate_deletion={args.immediate_deletion}, "
+                f"pipeline_size={args.pipeline_size}")
+
     if args.checksum:
         logger.info(f"Using {args.checksum} checksum algorithm for S3 operations")
-    
-    # Set start time for statistics
-    stats['start_time'] = time.time()
-    
-    # Create queues for object batches
-    marker_queue = asyncio.Queue(maxsize=2000)  # Increased queue size for better buffering
-    version_queue = asyncio.Queue(maxsize=2000)  # Increased queue size for better buffering
 
-    # Start status reporting thread
-    status_thread = threading.Thread(target=status_reporter)
-    status_thread.daemon = True
+    with stats_lock:
+        stats['start_time'] = time.time()
+
+    queue_depth = max(100, args.pipeline_size * 20)
+    marker_queue = asyncio.Queue(maxsize=queue_depth)
+    version_queue = asyncio.Queue(maxsize=queue_depth)
+
+    status_thread = threading.Thread(target=status_reporter, args=(marker_queue, version_queue), daemon=True)
     status_thread.start()
+
+    prefixes = get_listing_prefixes()
+    active_listers = min(len(prefixes), max(1, args.pipeline_size))
+    logger.info(f"Listing shards: {active_listers} (LIST_PREFIXES={'enabled' if prefixes != [None] else 'disabled'})")
 
     executor = ThreadPoolExecutor(max_workers=args.max_workers)
     try:
-        # Start listing task first if using immediate deletion
-        if args.immediate_deletion:
-            # Start listing task
-            listing_task = asyncio.create_task(list_object_versions(s3_client, marker_queue, version_queue))
+        deletion_workers = []
+        marker_workers = max(1, args.max_workers // 3)
+        version_workers = max(1, args.max_workers - marker_workers)
 
-            # Give listing a small head start to fill queues
-            await asyncio.sleep(0.5)
+        for i in range(version_workers):
+            deletion_workers.append(asyncio.create_task(deletion_worker(i, version_queue, executor)))
+        for i in range(marker_workers):
+            deletion_workers.append(asyncio.create_task(deletion_worker(version_workers + i, marker_queue, executor)))
 
-            # Start worker tasks for object deletion
-            deletion_workers = []
-            logger.info(f"Starting {args.max_workers} deletion workers with immediate processing")
+        listing_tasks = []
+        for idx, prefix in enumerate(prefixes[:active_listers]):
+            client = s3_client_pool[idx % len(s3_client_pool)]
+            listing_tasks.append(asyncio.create_task(list_object_versions(client, marker_queue, version_queue, prefix=prefix)))
 
-            for i in range(args.max_workers):
-                # Distribute workers - more for versions if that's typically more common
-                queue_to_use = version_queue if i < (args.max_workers * 0.7) else marker_queue
-                worker = asyncio.create_task(deletion_worker(i, queue_to_use, executor))
-                deletion_workers.append(worker)
+        await asyncio.gather(*listing_tasks)
+        logger.info("Object listing completed, draining deletion queues")
 
-            # Wait for listing to complete
-            await listing_task
-            logger.info("Object listing completed, waiting for deletion to finish")
+        for _ in range(marker_workers):
+            await marker_queue.put(None)
+        for _ in range(version_workers):
+            await version_queue.put(None)
 
-            # Send termination signals to workers
-            for i in range(args.max_workers):
-                if i < (args.max_workers * 0.7):
-                    await version_queue.put(None)
-                else:
-                    await marker_queue.put(None)
-
-            # Wait for all tasks to complete
-            await asyncio.gather(*deletion_workers)
-
-            # Wait for queues to be fully processed
-            await marker_queue.join()
-            await version_queue.join()
-        else:
-            # Traditional approach - wait for listing to complete first
-            logger.info("Using traditional mode: listing all objects before deleting")
-
-            # Start listing task
-            listing_task = asyncio.create_task(list_object_versions(s3_client, marker_queue, version_queue))
-
-            # Wait for listing to complete
-            await listing_task
-
-            # Start worker tasks for object deletion
-            deletion_workers = []
-            for i in range(args.max_workers):
-                worker = asyncio.create_task(
-                    deletion_worker(i, marker_queue if i < args.max_workers/2 else version_queue, executor)
-                )
-                deletion_workers.append(worker)
-
-            # Send termination signals to workers when they're done
-            for _ in range(args.max_workers // 2):
-                await marker_queue.put(None)
-            for _ in range(args.max_workers - args.max_workers // 2):
-                await version_queue.put(None)
-
-            # Wait for all tasks to complete
-            await asyncio.gather(*deletion_workers)
-
-            # Wait for queues to be fully processed
-            await marker_queue.join()
-            await version_queue.join()
+        await asyncio.gather(*deletion_workers)
+        await marker_queue.join()
+        await version_queue.join()
     finally:
         executor.shutdown(wait=True)
-    
-    # Calculate statistics
+        stop_event.set()
+
     end_time = time.time()
-    elapsed_time = end_time - stats['start_time']
+    snapshot = get_stats_snapshot()
+    elapsed_time = end_time - snapshot['start_time']
     hours, remainder = divmod(elapsed_time, 3600)
     minutes, seconds = divmod(remainder, 60)
-    
-    avg_rate = stats['objects_deleted'] / elapsed_time if elapsed_time > 0 else 0
-    
+
+    avg_rate = snapshot['objects_deleted'] / elapsed_time if elapsed_time > 0 else 0
+
     logger.info(f"Bucket cleanup completed in {int(hours)}h {int(minutes)}m {int(seconds)}s")
-    logger.info(f"Objects processed: {stats['objects_found']:,}, Deleted: {stats['objects_deleted']:,}, "
-              f"Errors: {stats['delete_errors']:,}")
+    logger.info(f"Objects processed: {snapshot['objects_found']:,}, Deleted: {snapshot['objects_deleted']:,}, "
+                f"Errors: {snapshot['delete_errors']:,}, Pages: {snapshot['pages_listed']:,}")
     logger.info(f"Average deletion rate: {avg_rate:.1f} objects/second")
-    
+
     return 0
 
 # Main entry point
