@@ -11,6 +11,7 @@ import asyncio
 import concurrent.futures
 import signal
 import sys
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from botocore.config import Config
 from functools import partial
@@ -42,6 +43,8 @@ parser.add_argument('--immediate_deletion', action='store_true', default=True,
                     help='Start deleting objects immediately while listing (default: True)')
 parser.add_argument('--deletion_delay', type=float, default=0,
                     help='Delay in seconds between deletion batches to avoid overwhelming the S3 service (default: 0)')
+parser.add_argument('--bypass-governance-retention', action='store_true',
+                    help='Set BypassGovernanceRetention on delete_objects requests (requires permissions/policy support)')
 args = parser.parse_args()
 
 # Set up logging
@@ -73,10 +76,17 @@ stats = {
     'delete_requests_sent': 0,
     'objects_deleted': 0,
     'delete_errors': 0,
+    'objects_unresolved': 0,
     'list_requests': 0,
     'objects_found': 0,
     'start_time': 0
 }
+
+failure_summary = defaultdict(lambda: {
+    'count': 0,
+    'samples': []
+})
+failure_summary_lock = threading.Lock()
 
 # Thread-safe counter for deletion rate limiting
 request_semaphore = threading.Semaphore(args.max_connections)
@@ -213,7 +223,7 @@ def status_reporter():
                 
                 # Print status with current and average rates
                 logger.info(f"Status: Deleted {stats['objects_deleted']:,}/{stats['objects_found']:,} objects "
-                          f"({stats['delete_errors']} errors) - "
+                          f"({stats['delete_errors']} errors, {stats['objects_unresolved']} unresolved) - "
                           f"Current rate: {delete_rate:.1f}/s, Average: {avg_rate:.1f}/s"
                           f"{eta_str}")
             
@@ -359,15 +369,53 @@ def delete_object_batch(batch):
         
     # Get a client from the pool
     client = get_s3_client()
+
+    def classify_error(code, message):
+        normalized_code = (code or '').lower()
+        normalized_message = (message or '').lower()
+
+        if 'accessdenied' in normalized_code:
+            return 'AccessDenied'
+        if 'invalidrequest' in normalized_code:
+            return 'InvalidRequest'
+        if 'operationaborted' in normalized_code:
+            return 'OperationAborted'
+        if 'mfa' in normalized_code or 'mfa' in normalized_message:
+            return 'MFARequiredOrInvalid'
+        if 'objectlock' in normalized_code or 'retention' in normalized_message or 'legal hold' in normalized_message:
+            return 'ObjectLockConstraint'
+        if 'governance' in normalized_message:
+            return 'GovernanceRetentionConstraint'
+        return 'Other'
+
+    def record_failure(category, key=None, version_id=None, code=None, message=None):
+        sample = {
+            'Key': key,
+            'VersionId': version_id,
+            'Code': code,
+            'Message': message
+        }
+        with failure_summary_lock:
+            entry = failure_summary[category]
+            entry['count'] += 1
+            if len(entry['samples']) < 5:
+                entry['samples'].append(sample)
     
     try:
         with request_semaphore:
-            result = client.delete_objects(
-                Bucket=BUCKET_NAME,
-                Delete={
+            delete_params = {
+                'Bucket': BUCKET_NAME,
+                'Delete': {
                     'Objects': batch,
                     'Quiet': True
                 }
+            }
+
+            if args.bypass_governance_retention:
+                delete_params['BypassGovernanceRetention'] = True
+
+            result = client.delete_objects(
+                **delete_params
             )
             
             # Update stats
@@ -380,6 +428,21 @@ def delete_object_batch(batch):
             if 'Errors' in result and result['Errors']:
                 error_count = len(result['Errors'])
                 stats['delete_errors'] += error_count
+                stats['objects_unresolved'] += error_count
+                deleted_count = max(len(batch) - error_count, 0)
+                stats['objects_deleted'] -= error_count
+
+                for error in result['Errors']:
+                    error_code = error.get('Code', 'Unknown')
+                    error_message = error.get('Message', '')
+                    category = classify_error(error_code, error_message)
+                    record_failure(
+                        category=category,
+                        key=error.get('Key'),
+                        version_id=error.get('VersionId'),
+                        code=error_code,
+                        message=error_message
+                    )
                 
                 # Only log a sample of errors to avoid flooding logs
                 if error_count > 0 and stats['delete_errors'] % 100 == 1:
@@ -392,8 +455,34 @@ def delete_object_batch(batch):
             
     except Exception as e:
         logger.error(f"Batch deletion error: {e}")
-        stats['delete_errors'] += 1
-        return 0, 1
+        unresolved_count = len(batch)
+        stats['delete_errors'] += unresolved_count
+        stats['objects_unresolved'] += unresolved_count
+        for obj in batch[:5]:
+            record_failure(
+                category='RequestFailure',
+                key=obj.get('Key'),
+                version_id=obj.get('VersionId'),
+                code='Exception',
+                message=str(e)
+            )
+        return 0, unresolved_count
+
+
+def log_failure_summary():
+    if not failure_summary:
+        logger.info("No categorized delete failures recorded")
+        return
+
+    logger.info("Failure summary by category:")
+    with failure_summary_lock:
+        for category, details in sorted(failure_summary.items(), key=lambda item: item[1]['count'], reverse=True):
+            logger.info(f"  - {category}: {details['count']} failure(s)")
+            for sample in details['samples']:
+                logger.info(
+                    f"      sample key={sample.get('Key')} version={sample.get('VersionId')} "
+                    f"code={sample.get('Code')} message={sample.get('Message')}"
+                )
 
 # Worker function for deletion consumer
 async def deletion_worker(worker_id, queue, executor):
@@ -564,8 +653,17 @@ async def process_bucket():
     
     logger.info(f"Bucket cleanup completed in {int(hours)}h {int(minutes)}m {int(seconds)}s")
     logger.info(f"Objects processed: {stats['objects_found']:,}, Deleted: {stats['objects_deleted']:,}, "
-              f"Errors: {stats['delete_errors']:,}")
+              f"Errors: {stats['delete_errors']:,}, Unresolved: {stats['objects_unresolved']:,}")
     logger.info(f"Average deletion rate: {avg_rate:.1f} objects/second")
+
+    if args.bypass_governance_retention:
+        logger.info("Governance retention bypass mode was enabled (--bypass-governance-retention)")
+
+    log_failure_summary()
+
+    if stats['objects_unresolved'] > 0:
+        logger.error("Cleanup completed with unresolved object versions/delete markers")
+        return 2
     
     return 0
 
