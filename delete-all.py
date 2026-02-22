@@ -43,6 +43,11 @@ parser.add_argument('--bypass-governance-retention', action='store_true',
                     help='Set BypassGovernanceRetention on delete_objects requests (requires permissions/policy support)')
 args = parser.parse_args()
 
+if args.max_passes < 1:
+    parser.error('--max_passes must be at least 1')
+if args.stable_empty_passes < 1:
+    parser.error('--stable_empty_passes must be at least 1')
+
 # Set up logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)

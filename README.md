@@ -46,6 +46,8 @@ python3 delete-all.py [options]
 | `--immediate-deletion` | flag | on | Start deleting objects while listing (default behavior). |
 | `--no-immediate-deletion` | flag | off | List all objects first, then start deletion. |
 | `--deletion_delay` | float | `0` | Delay in seconds between deletion batches. |
+| `--max_passes` | int | `10` | Maximum full list+delete passes before exiting non-zero if objects remain. |
+| `--stable_empty_passes` | int | `2` | Consecutive empty verification passes required before declaring convergence. |
 
 ## Examples
 ### 1) Use interactive prompts
